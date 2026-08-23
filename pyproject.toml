@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spftrace"
+version = "0.1.0"
+description = "RFC 7208 SPF evaluator that returns a full evaluation trace"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Scott McKeown" }]
+keywords = ["spf", "rfc7208", "email", "dns", "authentication", "trace"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Communications :: Email",
+  "Topic :: Internet :: Name Service (DNS)",
+  "Topic :: Security",
+  "Typing :: Typed",
+]
+dependencies = ["dnspython>=2.6"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pyyaml>=6"]
+
+[project.scripts]
+spftrace = "spftrace.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/smck83/spftrace"
+Source = "https://github.com/smck83/spftrace"
+Issues = "https://github.com/smck83/spftrace/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spftrace"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/spftrace", "tests", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
