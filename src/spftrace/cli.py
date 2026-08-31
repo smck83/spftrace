@@ -8,7 +8,8 @@ import os
 import sys
 
 from . import DEFAULT_MAX_QUERIES, DEFAULT_NAMESERVERS, __version__
-from .evaluator import DEFAULT_TIME_LIMIT, Evaluator, Limits
+from .evaluator import Evaluator
+from .session import DEFAULT_TIME_LIMIT, MAX_VOID_LOOKUPS, Limits
 from .resolver import LiveResolver
 from .trace import Result
 
@@ -24,14 +25,18 @@ VERDICT = {
 }
 
 
-def render_text(result: Result, dns_server: str = "") -> str:
+def render_text(
+    result: Result,
+    dns_server: str = "",
+    time_limit: float = DEFAULT_TIME_LIMIT,
+) -> str:
     lines: list[str] = []
     if dns_server:
         lines.append("PARAMETERS")
         lines.append(f"DNS server: {dns_server}")
-        lines.append(f"Evaluation time limit: {int(DEFAULT_TIME_LIMIT)} seconds "
+        lines.append(f"Evaluation time limit: {time_limit:g} seconds "
                      "(RFC 7208 Section 4.6.4)")
-        lines.append("Maximum number of void DNS lookups: 2 "
+        lines.append(f"Maximum number of void DNS lookups: {MAX_VOID_LOOKUPS} "
                      "(RFC 7208 Section 4.6.4)")
         lines.append("Standards compliance: RFC 7208 (April 2014)")
         lines.append("")
@@ -155,11 +160,15 @@ def render_text(result: Result, dns_server: str = "") -> str:
 
 async def run(args: argparse.Namespace) -> int:
     resolver = LiveResolver(
-        [args.dns], timeout=args.timeout, max_queries=args.max_queries
+        [args.dns], timeout=args.timeout
     )
     ev = Evaluator(
         resolver,
-        Limits(time_limit=args.time_limit, audit=args.audit),
+        Limits(
+            time_limit=args.time_limit,
+            max_queries=args.max_queries,
+            audit=args.audit,
+        ),
         receiver=args.receiver,
         policy_override=args.policy,
     )
@@ -167,7 +176,7 @@ async def run(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(result.to_dict(), indent=2))
     else:
-        print(render_text(result, dns_server=args.dns))
+        print(render_text(result, dns_server=args.dns, time_limit=args.time_limit))
     return 0 if result.result in ("pass", "neutral", "softfail", "fail", "none") else 1
 
 

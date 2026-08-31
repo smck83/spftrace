@@ -18,12 +18,18 @@ Inside an async application (FastAPI and friends), await the async form:
 For full control over DNS, build the resolver and evaluator yourself:
 
     from spftrace import Evaluator, Limits, LiveResolver
-    resolver = LiveResolver(["192.0.2.53"], timeout=3.0, max_queries=75)
-    result = await Evaluator(resolver, Limits()).evaluate(ip, sender, helo)
+    resolver = LiveResolver(["192.0.2.53"], timeout=3.0)
+    result = await Evaluator(resolver, Limits(max_queries=75)).evaluate(ip, sender, helo)
+
+The resolver is transport and may be reused. Everything scoped to one check,
+including the query budget, the void count and the cache, lives in an
+EvaluationSession built fresh by each evaluate() call.
 """
 from __future__ import annotations
 
 import asyncio
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _metadata_version
 from typing import Iterable
 
 from .errors import (
@@ -33,31 +39,28 @@ from .errors import (
     SpfTempError,
     SpfUsageError,
 )
-from .evaluator import (
+from .evaluator import MAX_MX_RECORDS, MAX_PTR_NAMES, Evaluator
+from .session import (
+    DEFAULT_MAX_QUERIES,
     DEFAULT_TIME_LIMIT,
     MAX_DNS_TERMS,
-    MAX_MX_RECORDS,
-    MAX_PTR_NAMES,
     MAX_VOID_LOOKUPS,
-    Evaluator,
+    EvaluationSession,
     Limits,
 )
 from .parser import Term, parse
 from .resolver import BaseResolver, DnsError, LiveResolver, ZoneResolver
 from .trace import DnsQueryRecord, Event, Result, Trace
 
-__version__ = "0.1.0"
+try:
+    __version__ = _metadata_version("spftrace")
+except PackageNotFoundError:  # running from a source tree without an install
+    __version__ = "0.0.0+unknown"
 
 #: Used only when no resolver and no nameservers are supplied. Callers that care
 #: which resolver answers should pass their own; this library never reads the
 #: system resolver configuration or any environment variable.
 DEFAULT_NAMESERVERS: tuple[str, ...] = ("8.8.8.8",)
-
-#: Hard cap on real DNS queries per evaluation. This is not the RFC's 10-term
-#: limit: that counts terms, not lookups, and ten `mx` terms with ten MX records
-#: each is 10 terms but 111 queries. This cap stops a hostile zone from turning
-#: one check into unbounded traffic.
-DEFAULT_MAX_QUERIES = 75
 
 __all__ = [
     "__version__",
@@ -69,6 +72,7 @@ __all__ = [
     "DEFAULT_TIME_LIMIT",
     "DnsError",
     "DnsQueryRecord",
+    "EvaluationSession",
     "Evaluator",
     "Event",
     "Limits",
@@ -118,33 +122,52 @@ async def acheck(
         policy: evaluate this record instead of looking one up in DNS. Useful for
             testing a record you have not published yet.
         resolver: a ready-made resolver. Mutually exclusive with `nameservers`.
-            Supply your own to add caching, or a ZoneResolver to test offline.
+            A resolver is DNS transport only, so one may be shared freely across
+            checks and across concurrent tasks. Pass a ZoneResolver to test
+            offline. Note that budgets, counters and the lookup cache belong to
+            the evaluation, not the resolver, so sharing one never carries state
+            between checks.
         nameservers: resolver addresses to query. Defaults to DEFAULT_NAMESERVERS.
         timeout: per-query DNS timeout in seconds.
-        max_queries: hard cap on real DNS queries, or None for no cap.
-        time_limit: overall deadline in seconds, checked between terms.
+        max_queries: hard cap on real DNS queries for this one evaluation, or
+            None for no cap.
+        time_limit: deadline in seconds for this one evaluation, checked between
+            terms and before every DNS query.
         receiver: value of the %{r} macro.
         audit: keep counting past the 10-term limit to report what a record
             really needs. The verdict is still forced to permerror, so this
             changes visibility and never the answer.
 
     Raises:
-        SpfUsageError: both `resolver` and `nameservers` were supplied.
+        SpfUsageError: both `resolver` and `nameservers` were supplied, or a
+            configuration value is out of range.
     """
     if resolver is not None and nameservers is not None:
         raise SpfUsageError(
             "pass either resolver or nameservers, not both: a supplied resolver "
-            "already carries its own nameservers, timeout and query budget"
+            "already carries its own nameservers and timeout"
+        )
+    if time_limit <= 0:
+        raise SpfUsageError(f"time_limit must be positive, got {time_limit!r}")
+    if timeout <= 0:
+        raise SpfUsageError(f"timeout must be positive, got {timeout!r}")
+    if max_queries is not None and max_queries < 1:
+        raise SpfUsageError(
+            f"max_queries must be at least 1, or None for no cap, got {max_queries!r}"
         )
     if resolver is None:
-        resolver = LiveResolver(
-            nameservers if nameservers is not None else DEFAULT_NAMESERVERS,
-            timeout=timeout,
-            max_queries=max_queries,
+        addresses = list(
+            nameservers if nameservers is not None else DEFAULT_NAMESERVERS
         )
+        if not addresses:
+            raise SpfUsageError(
+                "nameservers is empty: pass at least one resolver address, or "
+                "omit it to use DEFAULT_NAMESERVERS"
+            )
+        resolver = LiveResolver(addresses, timeout=timeout)
     evaluator = Evaluator(
         resolver,
-        Limits(time_limit=time_limit, audit=audit),
+        Limits(time_limit=time_limit, max_queries=max_queries, audit=audit),
         receiver=receiver,
         policy_override=policy,
     )

@@ -4,73 +4,26 @@ from __future__ import annotations
 import ipaddress
 import re
 import time
-from dataclasses import dataclass, field
 
 from . import macros as macro_mod
 from .errors import SpfNoneError, SpfPermError, SpfTempError
 from .macros import MacroContext, expand, truncate_domain
 from .parser import DNS_MECHANISMS, QUALIFIERS, Term, VERSION_RE, parse
 from .resolver import BaseResolver, DnsError
+from .session import (
+    DEFAULT_MAX_QUERIES,
+    DEFAULT_TIME_LIMIT,
+    MAX_DNS_TERMS,
+    MAX_VOID_LOOKUPS,
+    EvaluationSession,
+    Limits,
+)
 from .trace import Result, Trace
 
-MAX_DNS_TERMS = 10
-MAX_VOID_LOOKUPS = 2
 MAX_MX_RECORDS = 10
 MAX_PTR_NAMES = 10
-DEFAULT_TIME_LIMIT = 20.0
 
 LABEL_RE = re.compile(r"^[^.]{1,63}$")
-
-
-@dataclass
-class Limits:
-    max_terms: int = MAX_DNS_TERMS
-    max_void: int = MAX_VOID_LOOKUPS
-    time_limit: float = DEFAULT_TIME_LIMIT
-    terms_used: int = 0
-    void_used: int = 0
-    started: float = field(default_factory=time.monotonic)
-    # Audit mode keeps counting past a breached limit so the trace can report
-    # how many lookups the record actually needs. The returned result is still
-    # forced to permerror: this changes visibility, never the verdict.
-    audit: bool = False
-    audit_max_terms: int = 100
-    terms_exceeded: bool = False
-    void_exceeded: bool = False
-
-    @property
-    def exceeded(self) -> bool:
-        return self.terms_exceeded or self.void_exceeded
-
-    def check_deadline(self) -> None:
-        if time.monotonic() - self.started > self.time_limit:
-            raise SpfTempError("evaluation time limit exceeded")
-
-    def consume_term(self, name: str) -> bool:
-        """Returns True if this term is over the RFC limit (audit mode only)."""
-        if self.terms_used >= self.max_terms:
-            self.terms_exceeded = True
-            if not self.audit or self.terms_used >= self.audit_max_terms:
-                self.terms_used += 1
-                raise SpfPermError(
-                    f"DNS lookup limit exceeded ({self.max_terms}) at '{name}'"
-                )
-            self.terms_used += 1
-            return True
-        self.terms_used += 1
-        return False
-
-    def sync_void(self, resolver_void_count: int, name: str) -> bool:
-        """Void lookups are counted once, by the resolver. See resolver.query."""
-        before = self.void_used
-        self.void_used = resolver_void_count
-        if self.void_used > self.max_void:
-            self.void_exceeded = True
-            if not self.audit:
-                raise SpfPermError(
-                    f"void DNS lookup limit exceeded ({self.max_void}) at '{name}'"
-                )
-        return self.void_used > before
 
 
 def normalise_ip(ip: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
@@ -96,16 +49,34 @@ class Evaluator:
         policy_override: str | None = None,
     ) -> None:
         self.resolver = resolver
-        self.limits = limits or Limits()
+        #: Caller's configuration. Treated as a template: each evaluate() call
+        #: takes a fresh copy so counters never carry between runs.
+        self.limits_template = limits or Limits()
         self.receiver = receiver
         self.policy_override = policy_override
+        self.limits = self.limits_template
         self.trace = Trace()
         self.warnings: list[str] = []
-        self._void_limit_flagged = False
+        self.session = EvaluationSession(resolver, self.limits, self.trace)
+        self._override_used = False
+
+    def _begin(self) -> None:
+        """Build fresh per-run state. Called at the top of every evaluate().
+
+        Before 0.2.0 an Evaluator was silently one-shot: a second evaluate()
+        reused the first run's trace, counters and spent policy override, so
+        identical inputs could return different verdicts.
+        """
+        self.limits = self.limits_template.fresh()
+        self.trace = Trace()
+        self.warnings = []
+        self.session = EvaluationSession(self.resolver, self.limits, self.trace)
+        self._override_used = False
 
     # ---------- public entry point ----------
 
     async def evaluate(self, ip: str, sender: str, helo: str = "") -> Result:
+        self._begin()
         started = time.monotonic()
         try:
             addr = normalise_ip(ip)
@@ -172,11 +143,11 @@ class Evaluator:
             result=result,
             explanation=explanation,
             trace=self.trace,
-            queries=self.resolver.queries,
+            queries=list(self.session.queries),
             dns_terms_used=self.limits.terms_used,
             void_lookups_used=self.limits.void_used,
             elapsed_ms=(time.monotonic() - started) * 1000.0,
-            warnings=self.warnings,
+            warnings=list(self.warnings),
         )
 
     # ---------- check_host() ----------
@@ -220,8 +191,7 @@ class Evaluator:
             helo=helo,
             domain=domain,
             receiver=self.receiver,
-            resolver=self.resolver,
-            limits=self.limits,
+            session=self.session,
         )
 
         for term in record.terms:
@@ -270,7 +240,7 @@ class Evaluator:
             return self.policy_override
 
         try:
-            rcode, answers = await self.resolver.query(domain, "TXT")
+            rcode, answers = await self.session.query(domain, "TXT")
         except DnsError as exc:
             self.trace.add("txt_error", domain=domain, message=str(exc))
             raise SpfTempError(f"TXT lookup failed for {domain}") from exc
@@ -282,8 +252,6 @@ class Evaluator:
         if len(spf_records) > 1:
             raise SpfPermError(f"multiple v=spf1 records for {domain}")
         return spf_records[0]
-
-    _override_used = False
 
     # ---------- mechanisms ----------
 
@@ -305,6 +273,7 @@ class Evaluator:
         return target
 
     async def _eval_mechanism(self, term: Term, ctx: MacroContext) -> bool:
+        self.session.current_term = term.raw
         if term.name in DNS_MECHANISMS:
             if self.limits.consume_term(term.raw):
                 self.trace.add(
@@ -335,30 +304,9 @@ class Evaluator:
                 return await self._match_include(term, ctx)
             raise SpfPermError(f"unhandled mechanism {term.name}")
         finally:
-            if term.name in DNS_MECHANISMS:
-                if self.limits.sync_void(self.resolver.void_count, term.raw):
-                    self.trace.add(
-                        "void_lookup",
-                        used=self.limits.void_used,
-                        allowed=self.limits.max_void,
-                        term=term.raw,
-                        note="a lookup returned NXDOMAIN or no answers; "
-                             "exceeding the limit is permerror",
-                    )
-                if (
-                    self.limits.void_used > self.limits.max_void
-                    and not self._void_limit_flagged
-                ):
-                    self._void_limit_flagged = True
-                    self.trace.add(
-                        "limit_exceeded",
-                        limit="void_lookups",
-                        used=self.limits.void_used,
-                        allowed=self.limits.max_void,
-                        term=term.raw,
-                        note="beyond the RFC limit; counted for audit only, "
-                             "a real MTA stops here with permerror",
-                    )
+            # Void counting and enforcement now happen in EvaluationSession, at
+            # the moment the offending lookup returns. See session._enforce_void.
+            self.session.current_term = None
 
     def _match_ip4(self, term: Term, ctx: MacroContext) -> bool:
         if not ctx.is_v4:
@@ -403,7 +351,7 @@ class Evaluator:
             return False
         rtype = "A" if ctx.is_v4 else "AAAA"
         try:
-            _, addrs = await self.resolver.query(target, rtype)
+            _, addrs = await self.session.query(target, rtype)
         except DnsError as exc:
             raise SpfTempError(f"a: {exc}") from exc
         return self._addresses_match(addrs, term, ctx)
@@ -414,7 +362,7 @@ class Evaluator:
             self.trace.add("target_invalid", mechanism="mx", target=target)
             return False
         try:
-            _, exchanges = await self.resolver.query(target, "MX")
+            _, exchanges = await self.session.query(target, "MX")
         except DnsError as exc:
             raise SpfTempError(f"mx: {exc}") from exc
         if len(exchanges) > MAX_MX_RECORDS:
@@ -424,7 +372,7 @@ class Evaluator:
         rtype = "A" if ctx.is_v4 else "AAAA"
         for exchange in exchanges:
             try:
-                _, addrs = await self.resolver.query(exchange, rtype)
+                _, addrs = await self.session.query(exchange, rtype)
             except DnsError as exc:
                 raise SpfTempError(f"mx: {exc}") from exc
             if self._addresses_match(addrs, term, ctx):
@@ -436,7 +384,7 @@ class Evaluator:
         target = await self._target(term, ctx)
         rev = ctx.ip.reverse_pointer
         try:
-            _, names = await self.resolver.query(rev, "PTR")
+            _, names = await self.session.query(rev, "PTR")
         except DnsError:
             return False
         rtype = "A" if ctx.is_v4 else "AAAA"
@@ -446,7 +394,7 @@ class Evaluator:
             if not (name_l == target_l or name_l.endswith("." + target_l)):
                 continue
             try:
-                _, addrs = await self.resolver.query(name, rtype)
+                _, addrs = await self.session.query(name, rtype)
             except DnsError:
                 continue
             for addr in addrs:
@@ -464,7 +412,7 @@ class Evaluator:
             self.trace.add("target_invalid", mechanism="exists", target=target)
             return False
         try:
-            rcode, addrs = await self.resolver.query(target, "A")
+            rcode, addrs = await self.session.query(target, "A")
         except DnsError as exc:
             raise SpfTempError(f"exists: {exc}") from exc
         if not addrs:
@@ -508,6 +456,7 @@ class Evaluator:
                 term=term.raw,
                 note="beyond the RFC limit; counted for audit only",
             )
+        self.session.current_term = term.raw
         target = await self._target(term, ctx)
         self.trace.add("recurse_in", via="redirect", domain=target)
         self.trace.push()
@@ -519,8 +468,6 @@ class Evaluator:
             self.trace.pop()
             self.trace.add("recurse_out", via="redirect", domain=target, result="none")
             raise SpfPermError(f"redirect={target} has no SPF record") from exc
-        finally:
-            self.limits.sync_void(self.resolver.void_count, term.raw)
         self.trace.pop()
         self.trace.add("recurse_out", via="redirect", domain=target, result=result)
         return result, exp_term, exp_domain
@@ -536,17 +483,20 @@ class Evaluator:
             helo=helo,
             domain=domain,
             receiver=self.receiver,
-            resolver=self.resolver,
+            session=self.session,
         )
         try:
-            target = truncate_domain(await expand(exp_term.arg or "", ctx))
-            if not valid_domain(target):
-                return None
-            _, answers = await self.resolver.query(target, "TXT")
-            if len(answers) != 1:
-                return None
-            text = await expand(answers[0], ctx, exp=True)
-        except (SpfPermError, DnsError, ValueError):
+            # RFC 7208 4.6.4: a missing exp= domain must not consume void
+            # budget. The verdict is already decided by this point.
+            with self.session.void_exempt():
+                target = truncate_domain(await expand(exp_term.arg or "", ctx))
+                if not valid_domain(target):
+                    return None
+                _, answers = await self.session.query(target, "TXT")
+                if len(answers) != 1:
+                    return None
+                text = await expand(answers[0], ctx, exp=True)
+        except (SpfPermError, SpfTempError, DnsError, ValueError):
             return None
         if not macro_mod.LITERAL_OK.match(re.sub(r"%\{[^}]*\}", "", answers[0])):
             return None

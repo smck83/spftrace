@@ -1,16 +1,17 @@
-"""DNS layer. Every query is recorded: name, type, rcode, answers, timing, voidness.
+"""DNS transport.
 
 Two implementations share one interface so the evaluator never knows the difference:
   LiveResolver  - dnspython against a configured server
   ZoneResolver  - in-memory zone, used by the RFC 7208 test suite harness
+
+Recording, counting, caching and limit enforcement all live on
+EvaluationSession in session.py, one instance per SPF evaluation. A resolver is
+config plus a socket and nothing more, which is what makes it safe to share.
 """
 from __future__ import annotations
 
-import time
 from typing import Iterable
 
-from .errors import SpfPermError
-from .trace import DnsQueryRecord
 
 NOERROR = "NOERROR"
 NXDOMAIN = "NXDOMAIN"
@@ -23,57 +24,15 @@ class DnsError(Exception):
 
 
 class BaseResolver:
-    def __init__(self, max_queries: int | None = None) -> None:
-        self.queries: list[DnsQueryRecord] = []
-        self.max_queries = max_queries
-        self.network_queries = 0
-        self.void_count = 0
-        self._cache: dict[tuple[str, str], tuple[str, list[str]]] = {}
+    """DNS transport. Holds configuration, never evaluation state.
+
+    Subclass and implement `_lookup`. Counters, cache and the query trace live
+    on EvaluationSession, so one resolver may serve many evaluations, including
+    concurrent ones, without leaking state between them.
+    """
 
     async def _lookup(self, name: str, rtype: str) -> tuple[str, list[str]]:
         raise NotImplementedError
-
-    async def query(self, name: str, rtype: str) -> tuple[str, list[str]]:
-        """Returns (rcode, answers). Raises DnsError on SERVFAIL/TIMEOUT."""
-        key = (name.lower().rstrip("."), rtype)
-        start = time.monotonic()
-        if key in self._cache:
-            rcode, answers = self._cache[key]
-            source = "cache"
-            elapsed = 0.0
-        else:
-            source = "dns"
-            # The 10-term limit counts terms, not lookups: ten mx terms with ten
-            # MX records each is 10 terms but 111 queries. This is the real cap.
-            if self.max_queries is not None and self.network_queries >= self.max_queries:
-                raise SpfPermError(
-                    f"DNS query budget exceeded ({self.max_queries} lookups)"
-                )
-            self.network_queries += 1
-            rcode, answers = await self._lookup(name, rtype)
-            elapsed = (time.monotonic() - start) * 1000.0
-            if rcode in (NOERROR, NXDOMAIN):
-                self._cache[key] = (rcode, answers)
-        void = rcode == NXDOMAIN or (rcode == NOERROR and not answers)
-        # Counted here, once per real lookup. Counting per-term in the evaluator
-        # double counts: every enclosing include re-counts its children's voids,
-        # which turned a single void three includes deep into a false permerror.
-        if void and source == "dns":
-            self.void_count += 1
-        self.queries.append(
-            DnsQueryRecord(
-                name=name,
-                rtype=rtype,
-                rcode=rcode,
-                answers=list(answers),
-                ms=elapsed,
-                void=void,
-                source=source,
-            )
-        )
-        if rcode not in (NOERROR, NXDOMAIN):
-            raise DnsError(f"{rtype} {name}: {rcode}")
-        return rcode, answers
 
 
 class LiveResolver(BaseResolver):
@@ -81,9 +40,7 @@ class LiveResolver(BaseResolver):
         self,
         nameservers: Iterable[str],
         timeout: float = 5.0,
-        max_queries: int | None = None,
     ) -> None:
-        super().__init__(max_queries=max_queries)
         import dns.asyncresolver
 
         self.timeout = timeout
@@ -127,10 +84,7 @@ class LiveResolver(BaseResolver):
 class ZoneResolver(BaseResolver):
     """Zone is {name: [(rtype, value), ...]} or {name: 'TIMEOUT'}."""
 
-    def __init__(
-        self, zone: dict[str, object], max_queries: int | None = None
-    ) -> None:
-        super().__init__(max_queries=max_queries)
+    def __init__(self, zone: dict[str, object]) -> None:
         self.zone = {k.lower().rstrip("."): v for k, v in zone.items()}
 
     async def _lookup(self, name: str, rtype: str) -> tuple[str, list[str]]:
