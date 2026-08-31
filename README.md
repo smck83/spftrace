@@ -76,7 +76,8 @@ await spftrace.acheck(
     nameservers=["192.0.2.53"],  # defaults to 8.8.8.8
     timeout=5.0,                 # per-query DNS timeout
     max_queries=75,              # hard cap on real lookups
-    time_limit=20.0,             # overall deadline, checked between terms
+    time_limit=20.0,             # deadline, checked between terms and before
+                                 # every DNS query
     receiver="mta01",            # value of the %{r} macro
     audit=False,                 # see below
 )
@@ -87,8 +88,8 @@ is how you test a change before shipping it.
 
 ### Bring your own resolver
 
-Pass a `resolver` instead of `nameservers` to add caching, share a resolver across
-checks, or test with no network at all.
+Pass a `resolver` instead of `nameservers` to point at your own DNS, or to test
+with no network at all.
 
 ```python
 from spftrace import Evaluator, Limits, ZoneResolver
@@ -97,9 +98,34 @@ zone = {"e.com": [("TXT", "v=spf1 ip4:1.2.3.0/24 -all")]}
 result = await Evaluator(ZoneResolver(zone), Limits()).evaluate("1.2.3.4", "a@e.com")
 ```
 
-Subclass `BaseResolver` and implement `async _lookup(name, rtype) -> (rcode, answers)`
-for anything else. Query recording, caching, the void count and the budget are all
-handled in the base class.
+Subclass `BaseResolver` and implement
+`async _lookup(name, rtype) -> (rcode, answers)` for anything else. That method is
+the whole contract: return the rcode and the answer strings, and let the library
+do the rest.
+
+**A resolver is transport only.** It holds nameservers, a timeout and a socket.
+It holds no counters, no cache and no trace. Everything scoped to a single check
+lives in an `EvaluationSession` that `evaluate()` builds fresh each time, so one
+resolver can serve many checks, including concurrent ones, without leaking state
+between them.
+
+```python
+resolver = LiveResolver(["192.0.2.53"])   # build once, reuse for the process
+
+async def check(ip, sender):
+    return await spftrace.acheck(ip, sender, resolver=resolver)
+```
+
+This is a change in 0.2.0. Before it, the query budget, the void count, the query
+trace and the DNS cache all lived on the resolver, so reusing one carried a
+previous check's state into the next and could turn a passing message into a
+`permerror`. See CHANGELOG.md.
+
+The lookup cache is deliberately scoped to one evaluation. Within a check it
+still removes duplicate lookups, which is where nearly all the benefit is. Across
+checks it would have no TTL, and serving a stale SPF record is an authentication
+error rather than a performance detail. A shared TTL-aware cache may arrive later
+as an explicit opt-in.
 
 ## Errors are verdicts
 
@@ -109,8 +135,9 @@ exhausted query budget and a DNS timeout all come back as a `permerror` or
 in `try` just to survive a hostile zone.
 
 `SpfUsageError` is the exception you may see, and it always means the calling code
-is wrong: `check()` from inside an event loop, or `resolver` and `nameservers`
-supplied together.
+is wrong: `check()` from inside an event loop, `resolver` and `nameservers`
+supplied together, or a configuration value out of range such as a non-positive
+`time_limit`.
 
 ## Audit mode
 
@@ -153,14 +180,18 @@ will not bump it; a change consumers must notice will.
 
 - 10 DNS terms over `include`, `a`, `mx`, `ptr`, `exists` and `redirect`, not
   `ip4`, `ip6` or `all`
-- 2 void lookups, counted once at the resolver. Counting per term double counts:
+- 2 void lookups, counted once per real lookup by the evaluation session, and
+  enforced the moment the third one returns rather than at the end of the
+  mechanism. An `mx` pointing at a dozen dead exchanges stops after the third,
+  which is the point of the limit. Counting per term instead double counts:
   every enclosing `include` re-counts its children, and a single void three
   includes deep became a false `permerror`
 - 10 MX records per `mx`, 10 PTR names per `ptr`
 - `exp` and `%{p}` do DNS but do not count against the term limit
 - A separate hard cap on real queries, 75 by default, because the term limit
   counts terms and not lookups: ten `mx` terms with ten MX records each is 10
-  terms but 111 queries
+  terms but 111 queries. The cap is per evaluation, so it resets for every
+  message rather than draining over the life of a resolver
 
 ## Tests
 

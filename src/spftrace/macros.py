@@ -29,8 +29,9 @@ class MacroContext:
     helo: str
     domain: str  # <domain> of the current check_host()
     receiver: str = "spftrace"
-    resolver: Any = None
-    limits: Any = None
+    #: The EvaluationSession for this check. Macros that touch DNS (%{p})
+    #: go through it so their lookups are counted and traced like any other.
+    session: Any = None
 
     @property
     def localpart(self) -> str:
@@ -68,7 +69,7 @@ async def validated_domain(ctx: MacroContext) -> str:
         else ""
     )
     try:
-        _, names = await ctx.resolver.query(rev, "PTR")
+        _, names = await ctx.session.query(rev, "PTR")
     except DnsError:
         return "unknown"
     if not names:
@@ -78,7 +79,7 @@ async def validated_domain(ctx: MacroContext) -> str:
     for name in names[:10]:
         rtype = "A" if ctx.is_v4 else "AAAA"
         try:
-            _, addrs = await ctx.resolver.query(name, rtype)
+            _, addrs = await ctx.session.query(name, rtype)
         except DnsError:
             continue
         for addr in addrs:

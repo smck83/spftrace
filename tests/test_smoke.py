@@ -83,7 +83,7 @@ def _wide_zone(n: int = 14) -> dict:
 
 
 def test_term_limit_stops_at_eleven_of_ten():
-    evaluator = Evaluator(ZoneResolver(_wide_zone(), max_queries=100), Limits())
+    evaluator = Evaluator(ZoneResolver(_wide_zone()), Limits(max_queries=100))
     result = asyncio.run(evaluator.evaluate("1.2.3.4", "a@big.e.com"))
     assert result.result == "permerror"
     assert result.dns_terms_used == 11
@@ -92,7 +92,7 @@ def test_term_limit_stops_at_eleven_of_ten():
 def test_audit_counts_all_terms_but_never_upgrades_the_verdict():
     """A matching mechanism past the limit must still be permerror, not pass."""
     evaluator = Evaluator(
-        ZoneResolver(_wide_zone(), max_queries=100), Limits(audit=True)
+        ZoneResolver(_wide_zone()), Limits(max_queries=100, audit=True)
     )
     result = asyncio.run(evaluator.evaluate("1.2.3.4", "a@big.e.com"))
     assert result.result == "permerror"
@@ -100,7 +100,7 @@ def test_audit_counts_all_terms_but_never_upgrades_the_verdict():
 
 
 def test_query_budget_exhaustion_is_a_verdict_not_an_exception():
-    evaluator = Evaluator(ZoneResolver(_wide_zone(), max_queries=3), Limits())
+    evaluator = Evaluator(ZoneResolver(_wide_zone()), Limits(max_queries=3))
     result = asyncio.run(evaluator.evaluate("1.2.3.4", "a@big.e.com"))
     assert result.result == "permerror"
     assert len(result.queries) <= 3
