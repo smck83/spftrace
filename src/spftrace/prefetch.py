@@ -16,7 +16,16 @@ cap. The evaluator, on a cache miss, finds the answer already waiting or in
 flight. Verdict, term count, void count and trace order come out identical
 because the code that produces them has not changed. Only the waiting has.
 
-Two rules keep that promise:
+The tree is walked by callback, not by a parallel coroutine racing the
+evaluator. When a record's TXT lookup is issued, a done-callback is attached
+that parses the record and issues its children the instant the TXT resolves.
+Callbacks fire in the order they were registered, and the prefetcher registers
+its callback at issue time — before the evaluator has even awaited the same
+task. So the children of a record are always issued before the evaluator,
+resuming from that record's TXT, gets to iterate its terms. No sleeps, no
+races: at every level the evaluator finds the next lookup already in flight.
+
+Two rules keep the correctness promise:
 
   * A prefetched answer is accounted as a live lookup, not a cache hit. It
     goes through the query budget and the void count in EvaluationSession
@@ -25,11 +34,11 @@ Two rules keep that promise:
 
   * The prefetcher never raises into the evaluation and never shares the
     evaluator's counters. It has its own cap on speculative traffic; when it
-    runs out, or a branch fails, the evaluator simply does that lookup live.
-    A speculation failure is invisible except as lost speed.
+    runs out, or a branch fails for any non-DNS reason, the evaluator simply
+    does that lookup live. A speculation defect costs latency, never a verdict.
 
 The cost is speculative traffic. On a record that matches at its first term
-the prefetcher may still have fetched the whole tree. That is bounded by the
+the prefetcher may still have fetched part of the tree. That is bounded by the
 same number as `max_queries`, reported in `Result.prefetch`, and is the price
 of the speed. Evaluation traffic itself is unchanged.
 """
@@ -90,7 +99,10 @@ class Prefetcher:
         # turn a record that evaluates cleanly into a permerror.
         self._cap = limits.max_queries
         self._lookups: dict[Key, asyncio.Task] = {}
-        self._walkers: set[asyncio.Task] = set()
+        # Async side tasks: macro-target resolution and MX/PTR follow-ups.
+        # Tracked so close() can cancel them; the tree walk itself is driven
+        # by done-callbacks, not tasks.
+        self._tasks: set[asyncio.Task] = set()
         self._seen: set[str] = set()
         # Each nesting level costs at least one DNS term, so the sequential
         # evaluator cannot go deeper than the term limit lets it.
@@ -104,14 +116,16 @@ class Prefetcher:
     # ---------- lifecycle ----------
 
     def start(self, domain: str, policy_text: str | None = None) -> None:
-        """Begin walking from `domain`. Returns immediately; the walk runs as
-        background tasks on the current loop."""
+        """Begin speculating from `domain`. Returns immediately.
+
+        With a policy override the record is in hand, so its children are
+        issued synchronously right now. Otherwise the root TXT is issued with
+        the callback that will issue the children once it resolves.
+        """
         if policy_text is None:
-            # Issued here, synchronously, so the evaluator's very first query
-            # finds it rather than sending its own and leaving the walker's
-            # copy as waste.
-            self._issue(domain, "TXT")
-        self._spawn_walker(domain, policy_text, depth=0)
+            self._issue_policy(domain, 0)
+        else:
+            self._issue_children(domain, policy_text, 0)
 
     async def close(self) -> PrefetchStats:
         """Cancel whatever is still speculating. Called once the verdict is
@@ -119,14 +133,14 @@ class Prefetcher:
         if self._closed:
             return self.stats
         self._closed = True
-        pending = [t for t in self._walkers if not t.done()]
-        for t in pending:
-            t.cancel()
+        for t in self._tasks:
+            if not t.done():
+                t.cancel()
         for t in self._lookups.values():
             if not t.done():
                 t.cancel()
                 self.stats.cancelled += 1
-        await asyncio.gather(*self._walkers, *self._lookups.values(),
+        await asyncio.gather(*self._tasks, *self._lookups.values(),
                              return_exceptions=True)
         self.stats.wall_ms = (time.monotonic() - self._started) * 1000.0
         return self.stats
@@ -152,35 +166,23 @@ class Prefetcher:
 
     async def _serve(self, task: asyncio.Task, key: Key) -> tuple[str, list[str]]:
         try:
-            answer = await task
+            return await task
         except (DnsError, asyncio.TimeoutError, asyncio.CancelledError):
             # The same outcomes a live lookup produces; let the session map
             # them to temperror exactly as it would have.
             raise
         except Exception:
-            # Anything else is a speculation defect. Fall back to the live
-            # lookup so it costs latency and never the verdict.
+            # A speculation defect. Fall back to the live lookup so it costs
+            # latency and never the verdict.
             name, rtype = key
             return await self.resolver._lookup(name, rtype)
-        # One turn of the loop before handing the answer back. The evaluator
-        # awaited this task first, so it would otherwise wake first and ask
-        # for the next lookup before the walker, woken by the same answer,
-        # has issued it. That turn lets the walker's issue pass run, so the
-        # evaluator's next query finds a task instead of going live and
-        # leaving the walker's copy as a duplicate.
-        await asyncio.sleep(0)
-        return answer
 
     # ---------- the speculative side ----------
 
     def _issue(self, name: str, rtype: str) -> asyncio.Task | None:
-        """Start a speculative lookup, or return the one already started.
-
-        Synchronous on purpose. The walker issues every first-level lookup of
-        a record in one uninterrupted pass so that, by the time the evaluator
-        asks for any of them, the task already exists to be claimed. See
-        `_serve` for the other half of that arrangement.
-        """
+        """Start a speculative lookup, or return the one already in flight for
+        this name. Synchronous, so a whole record's worth of lookups can be
+        issued in one uninterrupted burst."""
         key = (name.lower().rstrip("."), rtype)
         task = self._lookups.get(key)
         if task is not None:
@@ -207,50 +209,75 @@ class Prefetcher:
 
     async def lookup(self, name: str, rtype: str) -> tuple[str, list[str]] | None:
         """Issue and await a speculative lookup. Never raises: a failure ends
-        this branch of the walk, and the evaluator does the lookup live if it
-        turns out to need it."""
+        this branch, and the evaluator does the lookup live if it needs it.
+        Used by the async side (MX/PTR follow-ups and the %{p} macro)."""
         return await self._await(self._issue(name, rtype))
 
     async def _await(self, task: asyncio.Task | None):
         if task is None:
             return None
         try:
-            # Shielded so cancelling a walker never cancels a lookup the
-            # evaluator may be waiting on at the same moment.
+            # Shielded so cancelling a side task never cancels a lookup the
+            # evaluator may be awaiting at the same moment.
             return await asyncio.shield(task)
         except asyncio.CancelledError:
             raise
         except Exception:
             return None
 
-    def _spawn_walker(self, domain: str, policy_text: str | None, depth: int) -> None:
+    def _spawn(self, coro) -> None:
         if self._closed:
+            coro.close()
             return
-        task = asyncio.create_task(self._walk(domain, policy_text, depth))
-        self._walkers.add(task)
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
-    async def _walk(self, domain: str, policy_text: str | None, depth: int) -> None:
-        """Read one policy, issue every lookup its terms could need, then
-        follow the ones that lead somewhere (includes, MX exchanges, PTR
-        names)."""
-        from .evaluator import valid_domain  # circular at module level
+    def _issue_policy(self, domain: str, depth: int) -> None:
+        """Issue a record's TXT and arrange for its children to be issued the
+        moment it resolves. The done-callback is registered here, before the
+        evaluator awaits the same task, so the children exist before the
+        evaluator — resuming from this TXT — iterates the record's terms."""
+        from .evaluator import valid_domain
 
-        domain_key = domain.lower().rstrip(".")
-        if depth > self._max_depth or domain_key in self._seen:
+        if self._closed or depth > self._max_depth or not valid_domain(domain):
             return
-        self._seen.add(domain_key)
+        key = (domain.lower().rstrip("."), "TXT")
+        already = key in self._lookups
+        task = self._issue(domain, "TXT")
+        if task is None or already:
+            return
+        task.add_done_callback(
+            lambda t, d=domain, dep=depth: self._on_policy(d, dep, t)
+        )
 
-        if policy_text is None:
-            if not valid_domain(domain):
+    def _on_policy(self, domain: str, depth: int, task: asyncio.Task) -> None:
+        """Done-callback: the TXT for `domain` has resolved. Issue its
+        children. Never raises — a callback that raised would only reach the
+        loop's exception handler and speculation is best-effort anyway."""
+        try:
+            if task.cancelled() or task.exception() is not None:
                 return
-            answer = await self.lookup(domain, "TXT")
-            if answer is None:
-                return
-            _, answers = answer
-            records = [a for a in answers if VERSION_RE.match(a)]
-            if len(records) != 1:
-                return
-            policy_text = records[0]
+            _, answers = task.result()
+        except Exception:
+            return
+        records = [a for a in answers if VERSION_RE.match(a)]
+        if len(records) != 1:
+            return
+        self._issue_children(domain, records[0], depth)
+
+    def _issue_children(self, domain: str, policy_text: str, depth: int) -> None:
+        """Synchronously issue every lookup this record's terms could need.
+
+        Macro-free targets (the common case: plain `include:` domains, `a`,
+        `mx host`) are issued right here in one burst. Terms needing macro
+        expansion, and the MX/PTR follow-ups that depend on an answer, are
+        handed to async side tasks.
+        """
+        key = domain.lower().rstrip(".")
+        if self._closed or depth > self._max_depth or key in self._seen:
+            return
+        self._seen.add(key)
 
         try:
             record = parse(policy_text)
@@ -271,65 +298,55 @@ class Prefetcher:
         if record.redirect is not None:
             terms.append(record.redirect)
 
-        # Pass one, synchronous: every term whose target needs no macro
-        # expansion (the overwhelming common case — plain include: domains,
-        # a, mx with a bare host) is issued here in one uninterrupted burst.
-        # No await runs between them, so all of a record's siblings exist as
-        # tasks before the loop yields, and the evaluator that resolved this
-        # record's TXT finds each one already in flight to claim rather than
-        # racing it to a live lookup. Terms needing a macro are deferred to
-        # pass two; MX/PTR follow-ups are deferred because they need an answer.
-        deferred = []
-        follow_ups = []
         for term in terms:
             if term.name in ("all", "ip4", "ip6"):
                 continue
-            target = self._plain_target(term, ctx)
-            if target is None and term.arg is not None and "%" in term.arg:
-                deferred.append(term)
+            if term.arg is not None and "%" in term.arg:
+                # Expansion may await (e.g. %{p} does DNS); resolve off-thread.
+                self._spawn(self._resolve_macro_term(term, ctx, rtype, depth))
                 continue
-            self._issue_for(term, target, ctx, rtype, follow_ups, depth)
+            target = self._plain_target(term, ctx)
+            follow = self._dispatch(term, target, ctx, rtype, depth)
+            if follow is not None:
+                self._spawn(follow)
 
-        # Pass two: macro targets (expansion may await, e.g. %{p}), then the
-        # follow-ups that depend on an answer (MX exchanges, PTR names).
-        for term in deferred:
-            target = await self._target(term, ctx)
-            self._issue_for(term, target, ctx, rtype, follow_ups, depth)
-        if follow_ups:
-            await asyncio.gather(*follow_ups, return_exceptions=True)
-
-    def _issue_for(self, term, target, ctx, rtype, follow_ups, depth) -> None:
-        """Issue the speculative lookup(s) a single term implies. Shared by
-        both passes so a plain and a macro target are handled identically once
-        the target is known."""
-        if term.name == "ptr":
-            # ptr keys off the connecting IP, not the (validated) target, so
-            # it can run even when the target failed to resolve.
+    def _dispatch(self, term, target, ctx, rtype, depth):
+        """Issue the lookup(s) one term implies, given its already-computed
+        target. Returns a follow-up coroutine (MX/PTR) to be awaited, or None.
+        Synchronous, so it is safe to call from `_issue_children`'s burst."""
+        name = term.name
+        if name == "ptr":
+            # ptr keys off the connecting IP, not the target, so it runs even
+            # when the target itself did not resolve.
             task = self._issue(ctx.ip.reverse_pointer, "PTR")
             if task is not None and target is not None:
-                follow_ups.append(self._follow_ptr(task, target, rtype))
-            return
+                return self._follow_ptr(task, target, rtype)
+            return None
         if target is None:
-            return
-        if term.name in ("include", "redirect"):
-            self._issue(target, "TXT")
-            self._spawn_walker(target, None, depth + 1)
-        elif term.name == "a":
+            return None
+        if name in ("include", "redirect"):
+            self._issue_policy(target, depth + 1)
+        elif name == "a":
             self._issue(target, rtype)
-        elif term.name == "exists":
+        elif name == "exists":
             self._issue(target, "A")
-        elif term.name == "mx":
+        elif name == "mx":
             task = self._issue(target, "MX")
             if task is not None:
-                follow_ups.append(self._follow_mx(task, rtype))
+                return self._follow_mx(task, rtype)
+        return None
+
+    async def _resolve_macro_term(self, term, ctx, rtype, depth) -> None:
+        target = await self._target(term, ctx)
+        follow = self._dispatch(term, target, ctx, rtype, depth)
+        if follow is not None:
+            await follow
 
     def _plain_target(self, term, ctx: MacroContext) -> str | None:
         """The term's target when it needs no macro expansion, else None.
 
         A macro-free domain-spec expands to itself, so the target is known
-        without awaiting. This is what lets pass one run synchronously. Returns
-        None both for an invalid target and for one that needs expansion; the
-        caller distinguishes the two by looking for '%' in the arg.
+        without awaiting. This is what lets the issue burst run synchronously.
         """
         from .evaluator import valid_domain
 
@@ -342,10 +359,9 @@ class Prefetcher:
         return target if valid_domain(target) else None
 
     async def _target(self, term, ctx: MacroContext) -> str | None:
-        """Mirror of Evaluator._target without the trace. Macro expansion is
-        a pure function of the inputs (plus DNS for %{p}, routed through the
-        prefetcher), so this predicts the same target the evaluator will
-        compute."""
+        """Mirror of Evaluator._target without the trace. Macro expansion is a
+        pure function of the inputs (plus DNS for %{p}, routed through the
+        prefetcher), so this predicts the same target the evaluator computes."""
         from .evaluator import valid_domain
 
         if term.arg is None:
