@@ -59,8 +59,23 @@ def render_text(
                     lines.append(f"{head}  Line #{i}: \"{rec}\"")
             else:
                 lines.append(f"{head}  No TXT records ({ev['rcode']}).")
+        elif kind == "prefetch_start":
+            lines.append(
+                f"{head}Prefetch enabled: speculating lookups for "
+                f"\"{ev['domain']}\" up to {ev['concurrency']} at a time. "
+                "Evaluation order and verdict are unchanged."
+            )
+        elif kind == "prefetch_done":
+            lines.append(
+                f"{head}Prefetch finished: {ev['issued']} lookups issued, "
+                f"{ev['served']} used by the evaluation, {ev['unused']} unused, "
+                f"{ev['cancelled']} cancelled."
+            )
         elif kind == "dns_lookup":
-            via = " (from cache, no query sent)" if ev["source"] == "cache" else ""
+            via = {
+                "cache": " (from cache, no query sent)",
+                "prefetch": " (prefetched)",
+            }.get(ev["source"], "")
             lines.append(
                 f"{head}Retrieving DNS {ev['rtype']} record for "
                 f"\"{ev['name']}\"{via}."
@@ -160,6 +175,13 @@ def render_text(
         f"DNS terms used: {result.dns_terms_used} of 10. "
         f"Void lookups: {result.void_lookups_used} of 2."
     )
+    if result.prefetch is not None:
+        pf = result.prefetch
+        lines.append(
+            f"Prefetch: {pf.issued} speculative lookups issued, {pf.served} used, "
+            f"{pf.unused} unused, {pf.cancelled} cancelled "
+            f"(up to {pf.concurrency} concurrent)."
+        )
     lines.append(f"Result: SPF {result.result}")
     lines.append(VERDICT.get(result.result, ""))
     if result.explanation:
@@ -179,6 +201,7 @@ async def run(args: argparse.Namespace) -> int:
             time_limit=args.time_limit,
             max_queries=args.max_queries,
             audit=args.audit,
+            prefetch=args.prefetch,
         ),
         receiver=args.receiver,
         policy_override=args.policy,
@@ -206,6 +229,12 @@ def main() -> int:
         "--audit",
         action="store_true",
         help="keep counting lookups past the 10 limit; result stays permerror",
+    )
+    p.add_argument(
+        "--prefetch",
+        action="store_true",
+        help="speculate the record's DNS lookups in parallel (up to 10 at once); "
+             "evaluation order and verdict are unchanged, only wall time",
     )
     p.add_argument(
         "--max-queries", type=int, default=DEFAULT_MAX_QUERIES, dest="max_queries"

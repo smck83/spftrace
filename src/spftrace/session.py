@@ -21,6 +21,7 @@ import asyncio
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from typing import Any
 
 from .errors import SpfPermError, SpfTempError
 from .resolver import NOERROR, NXDOMAIN, BaseResolver, DnsError
@@ -35,6 +36,11 @@ DEFAULT_TIME_LIMIT = 20.0
 #: each is 10 terms but 111 queries. This cap stops a hostile zone from turning
 #: one check into unbounded traffic.
 DEFAULT_MAX_QUERIES = 75
+
+#: Concurrent speculative lookups when prefetch is on. Ten is enough to take
+#: a wide include such as _netblocks.mimecast.com in one round trip without
+#: looking like a flood to the resolver.
+DEFAULT_PREFETCH_CONCURRENCY = 10
 
 
 @dataclass
@@ -59,6 +65,11 @@ class Limits:
     audit_max_terms: int = 100
     terms_exceeded: bool = False
     void_exceeded: bool = False
+    # Prefetch walks the record tree concurrently and warms a store the
+    # sequential evaluator then reads from. It changes wall time only: the
+    # evaluator's logic, counters and verdict are untouched. See prefetch.py.
+    prefetch: bool = False
+    prefetch_concurrency: int = DEFAULT_PREFETCH_CONCURRENCY
 
     @property
     def exceeded(self) -> bool:
@@ -73,6 +84,8 @@ class Limits:
             max_queries=self.max_queries,
             audit=self.audit,
             audit_max_terms=self.audit_max_terms,
+            prefetch=self.prefetch,
+            prefetch_concurrency=self.prefetch_concurrency,
             started=time.monotonic(),
         )
 
@@ -118,6 +131,10 @@ class EvaluationSession:
         #: Set by the evaluator so void events can name the term that caused
         #: them. Purely for the trace.
         self.current_term: str | None = None
+        #: Speculative lookups running ahead of evaluation. Attached by the
+        #: evaluator when Limits.prefetch is on. Answers served from here are
+        #: accounted exactly like live ones: the MTA would have sent them.
+        self.prefetcher: Any = None
 
     @property
     def void_count(self) -> int:
@@ -159,7 +176,6 @@ class EvaluationSession:
             source = "cache"
             elapsed = 0.0
         else:
-            source = "dns"
             # Checked here, not only between terms: one `mx` can issue a dozen
             # lookups, and a slow zone should not be able to run minutes past
             # the caller's deadline before anyone notices.
@@ -172,10 +188,23 @@ class EvaluationSession:
                     f"DNS query budget exceeded ({self.limits.max_queries} lookups)"
                 )
             self.network_queries += 1
+            # A prefetched answer is still a lookup the evaluation needed and
+            # a real MTA would have sent, so it goes through the same budget
+            # and (below) the same void accounting as a live one. Only the
+            # wait differs. Serving it as a cache hit instead would stop
+            # voids counting and turn a permerror into a pass.
+            pending = (
+                self.prefetcher.claim(key) if self.prefetcher is not None else None
+            )
+            if pending is not None:
+                source = "prefetch"
+                awaitable = pending
+            else:
+                source = "dns"
+                awaitable = self.resolver._lookup(name, rtype)
             try:
                 rcode, answers = await asyncio.wait_for(
-                    self.resolver._lookup(name, rtype),
-                    timeout=max(self.limits.remaining(), 0.0),
+                    awaitable, timeout=max(self.limits.remaining(), 0.0)
                 )
             except asyncio.TimeoutError as exc:
                 raise SpfTempError("evaluation time limit exceeded") from exc
@@ -187,7 +216,7 @@ class EvaluationSession:
         # Counted once per real lookup. Counting per-term double counts: every
         # enclosing include re-counts its children's voids, which turned a
         # single void three includes deep into a false permerror.
-        if void and source == "dns" and not self._void_exempt:
+        if void and source != "cache" and not self._void_exempt:
             self.limits.void_used += 1
 
         # The record is appended before any limit is enforced. A trace that
@@ -222,7 +251,7 @@ class EvaluationSession:
                 term=self.current_term,
             )
 
-        if void and source == "dns" and not self._void_exempt:
+        if void and source != "cache" and not self._void_exempt:
             self._note(
                 "void_lookup",
                 used=self.limits.void_used,

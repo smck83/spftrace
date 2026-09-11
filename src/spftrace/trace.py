@@ -67,6 +67,33 @@ class DnsQueryRecord:
 
 
 @dataclass
+class PrefetchStats:
+    """What the prefetcher did, so a trace can be honest about the traffic it
+    caused beyond what the evaluation itself needed. See prefetch.py."""
+
+    issued: int = 0      # speculative lookups started
+    served: int = 0      # of those, consumed by the evaluation
+    cancelled: int = 0   # still in flight when the verdict was reached
+    concurrency: int = 0
+    wall_ms: float = 0.0
+
+    @property
+    def unused(self) -> int:
+        """Completed lookups the evaluation never asked for: pure speculation."""
+        return max(self.issued - self.served - self.cancelled, 0)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "issued": self.issued,
+            "served": self.served,
+            "unused": self.unused,
+            "cancelled": self.cancelled,
+            "concurrency": self.concurrency,
+            "wall_ms": round(self.wall_ms, 1),
+        }
+
+
+@dataclass
 class Result:
     result: str
     explanation: str | None
@@ -76,6 +103,8 @@ class Result:
     void_lookups_used: int
     elapsed_ms: float
     warnings: list[str] = field(default_factory=list)
+    #: Present only when the evaluation ran with prefetch on.
+    prefetch: PrefetchStats | None = None
 
     @property
     def verdict(self) -> str:
@@ -93,4 +122,5 @@ class Result:
             "warnings": self.warnings,
             "queries": [q.to_dict() for q in self.queries],
             "events": self.trace.to_list(),
+            "prefetch": self.prefetch.to_dict() if self.prefetch else None,
         }

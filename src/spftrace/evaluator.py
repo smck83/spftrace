@@ -9,6 +9,7 @@ from . import macros as macro_mod
 from .errors import SpfNoneError, SpfPermError, SpfTempError
 from .macros import MacroContext, expand, truncate_domain
 from .parser import DNS_MECHANISMS, QUALIFIERS, Term, VERSION_RE, parse
+from .prefetch import PrefetchStats, Prefetcher
 from .resolver import BaseResolver, DnsError
 from .session import (
     DEFAULT_MAX_QUERIES,
@@ -59,6 +60,7 @@ class Evaluator:
         self.warnings: list[str] = []
         self.session = EvaluationSession(resolver, self.limits, self.trace)
         self._override_used = False
+        self._prefetch_stats: PrefetchStats | None = None
 
     def _begin(self) -> None:
         """Build fresh per-run state. Called at the top of every evaluate().
@@ -72,6 +74,7 @@ class Evaluator:
         self.warnings = []
         self.session = EvaluationSession(self.resolver, self.limits, self.trace)
         self._override_used = False
+        self._prefetch_stats: PrefetchStats | None = None
 
     # ---------- public entry point ----------
 
@@ -96,6 +99,22 @@ class Evaluator:
         if not helo:
             helo = domain
 
+        if self.limits.prefetch:
+            # Speculate the whole record tree in parallel while the sequential
+            # walk below proceeds as before. See prefetch.py for why the walk
+            # itself is never parallelised.
+            self.session.prefetcher = Prefetcher(
+                self.resolver, self.limits, addr, sender, helo, self.receiver
+            )
+            self.trace.add(
+                "prefetch_start",
+                domain=domain,
+                concurrency=self.limits.prefetch_concurrency,
+                note="speculative lookups run ahead of evaluation; "
+                     "the evaluation order and verdict are unchanged",
+            )
+            self.session.prefetcher.start(domain, self.policy_override)
+
         explanation = None
         try:
             result, exp_term, exp_frame = await self.check_host(
@@ -117,6 +136,10 @@ class Evaluator:
         except DnsError as exc:
             self.trace.add("exit", result="temperror", reason=str(exc))
             result = "temperror"
+        finally:
+            if self.session.prefetcher is not None:
+                self._prefetch_stats = await self.session.prefetcher.close()
+                self.trace.add("prefetch_done", **self._prefetch_stats.to_dict())
 
         if self.limits.exceeded and result != "permerror":
             self.trace.add(
@@ -148,6 +171,7 @@ class Evaluator:
             void_lookups_used=self.limits.void_used,
             elapsed_ms=(time.monotonic() - started) * 1000.0,
             warnings=list(self.warnings),
+            prefetch=self._prefetch_stats,
         )
 
     # ---------- check_host() ----------
