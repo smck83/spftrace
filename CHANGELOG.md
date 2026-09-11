@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.1
+
+### Added
+
+- **Address lookups are now in the trace.** Every DNS query was already recorded
+  in `Result.queries`, but only TXT lookups produced a trace event. A `mx` that
+  did not match therefore rendered as "Evaluating mechanism mx" followed by "The
+  mechanism did not match", with the MX query and the per-exchange A/AAAA
+  lookups invisible — the one detail someone debugging a legitimate sender is
+  looking for. `EvaluationSession.query` now emits a `dns_lookup` event for
+  every non-TXT query, carrying name, rtype, rcode, answers, ms, source
+  (`dns`/`cache`) and the term that caused it. TXT is unchanged: the evaluator
+  emits `txt_lookup` because it knows whether the answer is a policy.
+- The CLI renders those lookups under the mechanism that issued them, listing
+  the answers so the reader can see the addresses the client IP was compared
+  against, and marking cache hits so the elapsed times still read correctly.
+
+This is additive. No verdict changes, and `schema_version` stays at 1.
+
 ## 0.2.0
 
 An external review of 0.1.1 found that DNS state which belongs to a single SPF

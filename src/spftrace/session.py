@@ -204,6 +204,24 @@ class EvaluationSession:
             )
         )
 
+        # TXT is traced by the evaluator, which knows whether the answer is a
+        # policy, an explanation or neither. Everything else — the A/AAAA behind
+        # an `a`, the MX and its per-exchange address lookups, PTR — had no
+        # trace event at all, so a non-matching `mx` rendered as a bare "no
+        # match" with the actual work invisible. That is the one thing a reader
+        # debugging a legitimate sender needs to see.
+        if rtype != "TXT":
+            self._note(
+                "dns_lookup",
+                name=name,
+                rtype=rtype,
+                rcode=rcode,
+                answers=list(answers),
+                ms=round(elapsed, 1),
+                source=source,
+                term=self.current_term,
+            )
+
         if void and source == "dns" and not self._void_exempt:
             self._note(
                 "void_lookup",

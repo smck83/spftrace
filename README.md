@@ -176,6 +176,15 @@ only; the library itself never reads it.
 `to_dict()` is the stable JSON contract and carries `schema_version`. Additive keys
 will not bump it; a change consumers must notice will.
 
+The trace shows every lookup, not just the ones that decided the verdict. A `mx`
+term emits a `dns_lookup` event for the MX query and one for each exchange it
+resolves, so a mechanism that did not match still tells you which hosts were
+checked and what they resolved to. Only the exchanges actually queried appear:
+`mx` stops at the first match, and the trace does not imply work that never
+happened. The address family follows the connecting IP, per RFC 7208 section 5.3
+— an IPv4 client produces `A` lookups only, an IPv6 client `AAAA` only, never
+both.
+
 ## Limits enforced
 
 - 10 DNS terms over `include`, `a`, `mx`, `ptr`, `exists` and `redirect`, not

@@ -59,6 +59,17 @@ def render_text(
                     lines.append(f"{head}  Line #{i}: \"{rec}\"")
             else:
                 lines.append(f"{head}  No TXT records ({ev['rcode']}).")
+        elif kind == "dns_lookup":
+            via = " (from cache, no query sent)" if ev["source"] == "cache" else ""
+            lines.append(
+                f"{head}Retrieving DNS {ev['rtype']} record for "
+                f"\"{ev['name']}\"{via}."
+            )
+            if ev["answers"]:
+                for answer in ev["answers"]:
+                    lines.append(f"{head}  {answer}")
+            else:
+                lines.append(f"{head}  No {ev['rtype']} records ({ev['rcode']}).")
         elif kind == "policy_override":
             lines.append(f"{head}Policy supplied by user for \"{ev['domain']}\" "
                          "(no DNS lookup, no DNS term consumed).")
