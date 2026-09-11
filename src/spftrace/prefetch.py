@@ -267,39 +267,79 @@ class Prefetcher:
         )
         rtype = "A" if ctx.is_v4 else "AAAA"
 
-        # Pass one: issue. Left to right, and without yielding between terms
-        # unless a macro needs DNS (%{p}), so every first-level lookup exists
-        # before the evaluator can ask for it. Includes get their TXT issued
-        # here too, ahead of the walker that will read it.
-        follow_ups = []
         terms = [t for t in record.terms if t.is_mechanism]
         if record.redirect is not None:
             terms.append(record.redirect)
+
+        # Pass one, synchronous: every term whose target needs no macro
+        # expansion (the overwhelming common case — plain include: domains,
+        # a, mx with a bare host) is issued here in one uninterrupted burst.
+        # No await runs between them, so all of a record's siblings exist as
+        # tasks before the loop yields, and the evaluator that resolved this
+        # record's TXT finds each one already in flight to claim rather than
+        # racing it to a live lookup. Terms needing a macro are deferred to
+        # pass two; MX/PTR follow-ups are deferred because they need an answer.
+        deferred = []
+        follow_ups = []
         for term in terms:
             if term.name in ("all", "ip4", "ip6"):
                 continue
-            target = await self._target(term, ctx)
-            if target is None:
+            target = self._plain_target(term, ctx)
+            if target is None and term.arg is not None and "%" in term.arg:
+                deferred.append(term)
                 continue
-            if term.name in ("include", "redirect"):
-                self._issue(target, "TXT")
-                self._spawn_walker(target, None, depth + 1)
-            elif term.name == "a":
-                self._issue(target, rtype)
-            elif term.name == "exists":
-                self._issue(target, "A")
-            elif term.name == "mx":
-                task = self._issue(target, "MX")
-                if task is not None:
-                    follow_ups.append(self._follow_mx(task, rtype))
-            elif term.name == "ptr":
-                task = self._issue(ctx.ip.reverse_pointer, "PTR")
-                if task is not None:
-                    follow_ups.append(self._follow_ptr(task, target, rtype))
+            self._issue_for(term, target, ctx, rtype, follow_ups, depth)
 
-        # Pass two: the lookups that depend on an answer.
+        # Pass two: macro targets (expansion may await, e.g. %{p}), then the
+        # follow-ups that depend on an answer (MX exchanges, PTR names).
+        for term in deferred:
+            target = await self._target(term, ctx)
+            self._issue_for(term, target, ctx, rtype, follow_ups, depth)
         if follow_ups:
             await asyncio.gather(*follow_ups, return_exceptions=True)
+
+    def _issue_for(self, term, target, ctx, rtype, follow_ups, depth) -> None:
+        """Issue the speculative lookup(s) a single term implies. Shared by
+        both passes so a plain and a macro target are handled identically once
+        the target is known."""
+        if term.name == "ptr":
+            # ptr keys off the connecting IP, not the (validated) target, so
+            # it can run even when the target failed to resolve.
+            task = self._issue(ctx.ip.reverse_pointer, "PTR")
+            if task is not None and target is not None:
+                follow_ups.append(self._follow_ptr(task, target, rtype))
+            return
+        if target is None:
+            return
+        if term.name in ("include", "redirect"):
+            self._issue(target, "TXT")
+            self._spawn_walker(target, None, depth + 1)
+        elif term.name == "a":
+            self._issue(target, rtype)
+        elif term.name == "exists":
+            self._issue(target, "A")
+        elif term.name == "mx":
+            task = self._issue(target, "MX")
+            if task is not None:
+                follow_ups.append(self._follow_mx(task, rtype))
+
+    def _plain_target(self, term, ctx: MacroContext) -> str | None:
+        """The term's target when it needs no macro expansion, else None.
+
+        A macro-free domain-spec expands to itself, so the target is known
+        without awaiting. This is what lets pass one run synchronously. Returns
+        None both for an invalid target and for one that needs expansion; the
+        caller distinguishes the two by looking for '%' in the arg.
+        """
+        from .evaluator import valid_domain
+
+        if term.arg is None:
+            target = ctx.domain
+        elif "%" in term.arg:
+            return None
+        else:
+            target = truncate_domain(term.arg)
+        return target if valid_domain(target) else None
 
     async def _target(self, term, ctx: MacroContext) -> str | None:
         """Mirror of Evaluator._target without the trace. Macro expansion is
