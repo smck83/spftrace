@@ -42,6 +42,7 @@ from .errors import (
 from .evaluator import MAX_MX_RECORDS, MAX_PTR_NAMES, Evaluator
 from .session import (
     DEFAULT_MAX_QUERIES,
+    DEFAULT_PREFETCH_CONCURRENCY,
     DEFAULT_TIME_LIMIT,
     MAX_DNS_TERMS,
     MAX_VOID_LOOKUPS,
@@ -49,8 +50,9 @@ from .session import (
     Limits,
 )
 from .parser import Term, parse
+from .prefetch import Prefetcher
 from .resolver import BaseResolver, DnsError, LiveResolver, ZoneResolver
-from .trace import DnsQueryRecord, Event, Result, Trace
+from .trace import DnsQueryRecord, Event, PrefetchStats, Result, Trace
 
 try:
     __version__ = _metadata_version("spftrace")
@@ -69,6 +71,7 @@ __all__ = [
     "BaseResolver",
     "DEFAULT_MAX_QUERIES",
     "DEFAULT_NAMESERVERS",
+    "DEFAULT_PREFETCH_CONCURRENCY",
     "DEFAULT_TIME_LIMIT",
     "DnsError",
     "DnsQueryRecord",
@@ -81,6 +84,8 @@ __all__ = [
     "MAX_MX_RECORDS",
     "MAX_PTR_NAMES",
     "MAX_VOID_LOOKUPS",
+    "PrefetchStats",
+    "Prefetcher",
     "Result",
     "SpfError",
     "SpfNoneError",
@@ -107,6 +112,7 @@ async def acheck(
     time_limit: float = DEFAULT_TIME_LIMIT,
     receiver: str = "spftrace",
     audit: bool = False,
+    prefetch: bool = False,
 ) -> Result:
     """Evaluate SPF for `ip` sending as `sender`, returning a traced Result.
 
@@ -137,6 +143,12 @@ async def acheck(
         audit: keep counting past the 10-term limit to report what a record
             really needs. The verdict is still forced to permerror, so this
             changes visibility and never the answer.
+        prefetch: speculate the record tree's DNS lookups in parallel, up to
+            ten at a time, while the evaluation itself proceeds sequentially
+            as the RFC requires. Verdict, term count and void count are
+            identical to a sequential run; only wall time changes. Costs
+            speculative traffic on records that match early, reported in
+            `Result.prefetch`.
 
     Raises:
         SpfUsageError: both `resolver` and `nameservers` were supplied, or a
@@ -167,7 +179,12 @@ async def acheck(
         resolver = LiveResolver(addresses, timeout=timeout)
     evaluator = Evaluator(
         resolver,
-        Limits(time_limit=time_limit, max_queries=max_queries, audit=audit),
+        Limits(
+            time_limit=time_limit,
+            max_queries=max_queries,
+            audit=audit,
+            prefetch=prefetch,
+        ),
         receiver=receiver,
         policy_override=policy,
     )
@@ -187,6 +204,7 @@ def check(
     time_limit: float = DEFAULT_TIME_LIMIT,
     receiver: str = "spftrace",
     audit: bool = False,
+    prefetch: bool = False,
 ) -> Result:
     """Blocking form of `acheck`, for scripts and sync code.
 
@@ -218,5 +236,6 @@ def check(
             time_limit=time_limit,
             receiver=receiver,
             audit=audit,
+            prefetch=prefetch,
         )
     )
