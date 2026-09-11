@@ -172,6 +172,7 @@ only; the library itself never reads it.
 | `void_lookups_used` | void lookups against the limit of 2 |
 | `elapsed_ms` | wall time for the evaluation |
 | `warnings` | non-fatal notes about the record |
+| `prefetch` | speculation stats when `prefetch=True`, else `None` |
 
 `to_dict()` is the stable JSON contract and carries `schema_version`. Additive keys
 will not bump it; a change consumers must notice will.
@@ -184,6 +185,32 @@ checked and what they resolved to. Only the exchanges actually queried appear:
 happened. The address family follows the connecting IP, per RFC 7208 section 5.3
 — an IPv4 client produces `A` lookups only, an IPv6 client `AAAA` only, never
 both.
+
+## Parallel DNS prefetch
+
+Evaluation is sequential because SPF is short-circuit: the first matching
+mechanism decides the verdict, and that ordering is what fixes the term and
+void counts. But the DNS behind a record need not be sequential. A record like
+`_netblocks.mimecast.com`, which fans out to five regional includes, spends
+almost all its wall time waiting on round trips taken one at a time.
+
+`prefetch=True` speculates those lookups in parallel — up to ten at once —
+while the untouched sequential evaluator runs and finds each answer already
+waiting:
+
+```python
+r = spftrace.check(ip, sender, prefetch=True)   # or Limits(prefetch=True), or --prefetch
+```
+
+The verdict, the term count, the void count and the order of the trace are
+identical to a sequential run; only wall time changes. This is verified by
+running the full RFC 7208 corpus both ways and asserting they agree on every
+case. A prefetched answer is charged to the query budget and the void count
+like any live lookup, because a receiving MTA would have sent it; speculation
+is capped, is cancelled the moment the verdict is known, and on any failure
+falls back to a live lookup, so it can never change the answer. The cost is
+speculative traffic on records that match early — reported in `Result.prefetch`.
+Off by default.
 
 ## Limits enforced
 

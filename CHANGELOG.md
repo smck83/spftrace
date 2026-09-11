@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- **Optional parallel DNS prefetch (`prefetch=True`).** A wide or deep record —
+  `_netblocks.mimecast.com` fans out to five regional includes, each a further
+  lookup — is dominated by DNS round trips taken one after another. With
+  prefetch on, a speculative walker reads the record tree and issues its
+  lookups concurrently (up to ten at a time) while evaluation proceeds. On a
+  real record (`stoweaustralia.com.au`) this cut a live check from ~740 ms to
+  ~80 ms.
+
+  **Evaluation itself is unchanged and still sequential.** SPF is
+  short-circuit — the first matching mechanism decides the verdict, and that
+  ordering is what determines the term count, the void count and therefore the
+  result. Parallelising evaluation would put all of that at risk. So only DNS
+  is parallel: the prefetcher warms a store, and the untouched sequential
+  evaluator finds each answer already waiting. Verdict, term count, void count
+  and trace order are identical to a sequential run — asserted by running the
+  full 203-case RFC 7208 corpus both ways and comparing.
+
+  A prefetched answer is accounted as a real lookup (budget and void count),
+  because a receiving MTA would have sent it. Speculation has its own traffic
+  cap, is cancelled the moment the verdict is known, and can never change the
+  answer: a speculation failure falls back to a live lookup. The cost is
+  speculative traffic on records that match early, reported in the new
+  `Result.prefetch` and in the trace's `prefetch_start` / `prefetch_done`
+  events. Off by default; enable per call (`check(..., prefetch=True)`),
+  per evaluator (`Limits(prefetch=True)`), or on the CLI (`--prefetch`).
+
 ## 0.2.1
 
 ### Added
